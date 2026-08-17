@@ -1,0 +1,72 @@
+name: Deploy Static Website
+
+on:
+  push:
+    branches: [main]
+
+# Required for OIDC - lets GitHub request a short-lived AWS credential
+# instead of using long-lived access keys stored as secrets.
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Exchanges a GitHub-issued OIDC token for temporary AWS credentials.
+      # Nothing long-lived is stored in GitHub - see README Step 3 for how
+      # to set up the trust relationship this depends on.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: terraform
+        run: terraform plan -input=false -out=tfplan -var="bucket_name=${{ secrets.WEBSITE_BUCKET_NAME }}"
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -input=false -auto-approve tfplan
+
+      - name: Capture Terraform outputs
+        id: tf_outputs
+        working-directory: terraform
+        run: |
+          echo "bucket_name=$(terraform output -raw bucket_name)" >> "$GITHUB_OUTPUT"
+          echo "distribution_id=$(terraform output -raw cloudfront_distribution_id)" >> "$GITHUB_OUTPUT"
+
+      - name: Sync website files to S3
+        working-directory: website
+        run: |
+          aws s3 sync . "s3://${{ steps.tf_outputs.outputs.bucket_name }}" \
+            --delete \
+            --cache-control "max-age=3600"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ steps.tf_outputs.outputs.distribution_id }}" \
+            --paths "/*"
